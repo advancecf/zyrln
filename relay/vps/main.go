@@ -15,6 +15,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"golang.org/x/net/proxy"
 )
 
 const maxBodyBytes = 32 * 1024 * 1024
@@ -38,13 +39,34 @@ func main() {
 	listen := flag.String("listen", envDefault("ZYRLN_RELAY_LISTEN", "127.0.0.1:8787"), "listen address")
 	key := flag.String("key", os.Getenv("ZYRLN_RELAY_KEY"), "optional relay key required in X-Relay-Key")
 	timeout := flag.Duration("timeout", 45*time.Second, "target request timeout")
+    socks := flag.String("socks5", os.Getenv("SOCKS5_PROXY"), "SOCKS5 proxy (host:port)")
 	flag.Parse()
+	
+	var dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 
+	if *socks != "" {
+		log.Printf("using SOCKS5 proxy: %s", *socks)
+
+		dialer, err := proxy.SOCKS5("tcp", *socks, nil, proxy.Direct)
+		if err != nil {
+			log.Fatalf("failed to create SOCKS5 dialer: %v", err)
+		}
+
+		dialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialer.Dial(network, addr)
+		}
+	} else {
+		log.Printf("no SOCKS5 proxy set, using direct connection")
+
+		dialContext = (&net.Dialer{
+			Timeout:   15 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext
+	}
 	client := &http.Client{
 		Timeout: *timeout,
 		Transport: &http.Transport{
-			Proxy:                 http.ProxyFromEnvironment,
-			DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			DialContext:           dialContext,
 			ForceAttemptHTTP2:     true,
 			MaxIdleConns:          256,
 			MaxIdleConnsPerHost:   64,
