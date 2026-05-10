@@ -22,7 +22,7 @@ func TestCacheableMaxAge_Cacheable(t *testing.T) {
 		{"max-age=60, must-revalidate", time.Minute},
 	}
 	for _, c := range cases {
-		got := cacheableMaxAge("GET", map[string]string{}, map[string]string{"Cache-Control": c.cc}, 200)
+		got := cacheableMaxAge("GET", map[string]string{}, map[string][]string{"cache-control": {c.cc}}, 200, "https://example.com/page")
 		if got != c.ttl {
 			t.Errorf("Cache-Control %q: got %v, want %v", c.cc, got, c.ttl)
 		}
@@ -35,23 +35,30 @@ func TestCacheableMaxAge_NotCacheable(t *testing.T) {
 		method      string
 		status      int
 		reqHeaders  map[string]string
-		respHeaders map[string]string
+		respHeaders map[string][]string
 	}{
-		{"POST", "POST", 200, map[string]string{}, map[string]string{"Cache-Control": "max-age=3600"}},
-		{"non-200", "GET", 301, map[string]string{}, map[string]string{"Cache-Control": "max-age=3600"}},
-		{"no-store", "GET", 200, map[string]string{}, map[string]string{"Cache-Control": "no-store"}},
-		{"no-cache", "GET", 200, map[string]string{}, map[string]string{"Cache-Control": "no-cache"}},
-		{"private", "GET", 200, map[string]string{}, map[string]string{"Cache-Control": "private, max-age=3600"}},
-		{"no Cache-Control", "GET", 200, map[string]string{}, map[string]string{}},
-		{"max-age=0", "GET", 200, map[string]string{}, map[string]string{"Cache-Control": "max-age=0"}},
-		{"Authorization", "GET", 200, map[string]string{"Authorization": "Bearer tok"}, map[string]string{"Cache-Control": "max-age=3600"}},
-		{"Set-Cookie", "GET", 200, map[string]string{}, map[string]string{"Cache-Control": "max-age=3600", "Set-Cookie": "sid=x"}},
+		{"POST", "POST", 200, map[string]string{}, map[string][]string{"cache-control": {"max-age=3600"}}},
+		{"non-200", "GET", 301, map[string]string{}, map[string][]string{"cache-control": {"max-age=3600"}}},
+		{"no-store", "GET", 200, map[string]string{}, map[string][]string{"cache-control": {"no-store"}}},
+		{"no-cache", "GET", 200, map[string]string{}, map[string][]string{"cache-control": {"no-cache"}}},
+		{"private", "GET", 200, map[string]string{}, map[string][]string{"cache-control": {"private, max-age=3600"}}},
+		{"no Cache-Control", "GET", 200, map[string]string{}, map[string][]string{}},
+		{"max-age=0", "GET", 200, map[string]string{}, map[string][]string{"cache-control": {"max-age=0"}}},
+		{"Authorization", "GET", 200, map[string]string{"Authorization": "Bearer tok"}, map[string][]string{"cache-control": {"max-age=3600"}}},
+		{"Set-Cookie", "GET", 200, map[string]string{}, map[string][]string{"cache-control": {"max-age=3600"}, "set-cookie": {"sid=x"}}},
 	}
 	for _, c := range cases {
-		got := cacheableMaxAge(c.method, c.reqHeaders, c.respHeaders, c.status)
+		got := cacheableMaxAge(c.method, c.reqHeaders, c.respHeaders, c.status, "https://example.com/page")
 		if got != 0 {
 			t.Errorf("case %q: expected 0, got %v", c.name, got)
 		}
+	}
+}
+
+func TestCacheableMaxAge_StaticAssetWithoutCacheControl(t *testing.T) {
+	got := cacheableMaxAge("GET", map[string]string{}, map[string][]string{}, 200, "https://example.com/app.js")
+	if got != 5*time.Minute {
+		t.Errorf("static asset without Cache-Control: got %v, want 5m", got)
 	}
 }
 
@@ -61,7 +68,7 @@ func TestResponseCache_HitAndMiss(t *testing.T) {
 	rc := newResponseCache()
 	rc.set("https://example.com/a.js", &cacheEntry{
 		status:  200,
-		headers: map[string]string{"content-type": "application/javascript"},
+		headers: map[string][]string{"content-type": {"application/javascript"}},
 		body:    []byte("console.log(1)"),
 		expiry:  time.Now().Add(time.Hour),
 	})
@@ -122,7 +129,7 @@ func TestCoalescer_CacheHitSkipsRelay(t *testing.T) {
 		callCount.Add(1)
 		json.NewEncoder(w).Encode(workerResponse{
 			Status:  200,
-			Headers: map[string]string{"Cache-Control": "max-age=3600"},
+			Headers: map[string]any{"cache-control": []string{"max-age=3600"}},
 			Body:    base64.StdEncoding.EncodeToString([]byte("cached-body")),
 		})
 	}))
@@ -153,7 +160,7 @@ func TestCoalescer_NoCacheForNoStore(t *testing.T) {
 		callCount.Add(1)
 		json.NewEncoder(w).Encode(workerResponse{
 			Status:  200,
-			Headers: map[string]string{"Cache-Control": "no-store"},
+			Headers: map[string]any{"cache-control": []string{"no-store"}},
 			Body:    base64.StdEncoding.EncodeToString([]byte("dynamic")),
 		})
 	}))
@@ -174,7 +181,7 @@ func TestCoalescer_NoCacheForPost(t *testing.T) {
 		callCount.Add(1)
 		json.NewEncoder(w).Encode(workerResponse{
 			Status:  200,
-			Headers: map[string]string{"Cache-Control": "max-age=3600"},
+			Headers: map[string]any{"cache-control": []string{"max-age=3600"}},
 			Body:    base64.StdEncoding.EncodeToString([]byte("resp")),
 		})
 	}))
@@ -195,7 +202,7 @@ func TestCoalescer_NoCacheForSetCookie(t *testing.T) {
 		callCount.Add(1)
 		json.NewEncoder(w).Encode(workerResponse{
 			Status:  200,
-			Headers: map[string]string{"Cache-Control": "max-age=3600", "Set-Cookie": "sid=abc"},
+			Headers: map[string]any{"cache-control": []string{"max-age=3600"}, "set-cookie": []string{"sid=abc"}},
 			Body:    base64.StdEncoding.EncodeToString([]byte("resp")),
 		})
 	}))

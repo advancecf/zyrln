@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -104,15 +106,46 @@ func TestForwardHeaders_MultiValueTakesFirst(t *testing.T) {
 	}
 }
 
+func TestStartProxy_AllowsEmptyURLList(t *testing.T) {
+	srv, ln, err := StartProxy("127.0.0.1:0", nil, "www.google.com", "k", nil, http.DefaultClient, time.Second)
+	if err != nil {
+		t.Fatalf("StartProxy with empty URL list returned error: %v", err)
+	}
+	_ = ln.Close()
+	_ = srv.Close()
+}
+
+func TestCoalescerFlush_RejectsEmptyURLList(t *testing.T) {
+	c := &Coalescer{}
+	batch := []*coalescerItem{
+		{result: make(chan coalescerResult, 1)},
+		{result: make(chan coalescerResult, 1)},
+	}
+
+	c.flush(batch)
+
+	for i, item := range batch {
+		select {
+		case got := <-item.result:
+			if got.err == nil {
+				t.Fatalf("item %d: expected error", i)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("item %d: timed out waiting for error", i)
+		}
+	}
+}
+
 // fakeAppScript builds a TLS test server that responds like Apps Script single-relay.
 func fakeAppScript(t *testing.T, body string, status int) *httptest.Server {
 	t.Helper()
 	return httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		resp := workerResponse{
 			Status:  status,
-			Headers: map[string]string{"content-type": "text/plain"},
+			Headers: map[string]any{"content-type": []string{"text/plain"}},
 			Body:    base64.StdEncoding.EncodeToString([]byte(body)),
 		}
+		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 	}))
 }
@@ -152,6 +185,72 @@ func TestHandleHTTP_RelayError_Returns502(t *testing.T) {
 
 	if w.Code != http.StatusBadGateway {
 		t.Errorf("status = %d, want 502", w.Code)
+	}
+}
+
+func TestStartProxyWithSOCKS_RelaysHTTP(t *testing.T) {
+	srv := fakeAppScript(t, "proxied via socks", 200)
+	defer srv.Close()
+
+	httpSrv, httpLn, socksSrv, socksLn, err := StartProxyWithSOCKS("127.0.0.1:0", "127.0.0.1:0", []string{srv.URL}, srv.Listener.Addr().String(), "k", nil, srv.Client(), time.Second)
+	if err != nil {
+		t.Fatalf("StartProxyWithSOCKS: %v", err)
+	}
+	defer httpLn.Close()
+	defer httpSrv.Close()
+	defer socksLn.Close()
+	_ = socksSrv
+
+	conn, err := net.Dial("tcp", socksLn.Addr().String())
+	if err != nil {
+		t.Fatalf("dial socks: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		t.Fatalf("write greeting: %v", err)
+	}
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("read greeting reply: %v", err)
+	}
+	if string(buf) != string([]byte{0x05, 0x00}) {
+		t.Fatalf("greeting reply = %v, want [5 0]", buf)
+	}
+
+	host := "example.com"
+	req := append([]byte{0x05, 0x01, 0x00, 0x03, byte(len(host))}, []byte(host)...)
+	req = append(req, 0x00, 0x50)
+	if _, err := conn.Write(req); err != nil {
+		t.Fatalf("write connect request: %v", err)
+	}
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(conn, reply); err != nil {
+		t.Fatalf("read connect reply: %v", err)
+	}
+	if reply[0] != 0x05 || reply[1] != 0x00 {
+		t.Fatalf("connect reply = %v, want success", reply)
+	}
+
+	if _, err := fmt.Fprintf(conn, "GET /test HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", host); err != nil {
+		t.Fatalf("write http request: %v", err)
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("ReadResponse: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if string(body) != "proxied via socks" {
+		t.Fatalf("body = %q, want proxied via socks", body)
 	}
 }
 
@@ -479,5 +578,69 @@ func TestRelayRequestMulti_SplitsTimeout(t *testing.T) {
 	got = perURLTimeout(4*time.Second, 2)
 	if got != 8*time.Second {
 		t.Errorf("got %v, want 8s (minimum)", got)
+	}
+}
+
+func TestFmtBytes(t *testing.T) {
+	cases := []struct {
+		in   int
+		want string
+	}{
+		{0, "0 B"},
+		{1023, "1023 B"},
+		{1024, "1.0 KB"},
+		{1536, "1.5 KB"},
+		{1024 * 1024, "1.0 MB"},
+		{1024*1024 + 512*1024, "1.5 MB"},
+	}
+	for _, c := range cases {
+		got := fmtBytes(c.in)
+		if got != c.want {
+			t.Errorf("fmtBytes(%d) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestLogf_NilLogFunc(t *testing.T) {
+	SetLogFunc(nil)
+	defer SetLogFunc(nil)
+	// must not panic
+	logf("info", "hello %s", "world")
+}
+
+func TestLogf_RoutesToLogFunc(t *testing.T) {
+	defer SetLogFunc(nil)
+
+	var gotLevel, gotMsg string
+	SetLogFunc(func(level, msg string) {
+		gotLevel = level
+		gotMsg = msg
+	})
+	logf("error", "test %d", 42)
+	if gotLevel != "error" {
+		t.Errorf("level = %q, want error", gotLevel)
+	}
+	if gotMsg != "test 42" {
+		t.Errorf("msg = %q, want %q", gotMsg, "test 42")
+	}
+}
+
+func TestWriteHTTPError(t *testing.T) {
+	client, server := net.Pipe()
+	go func() {
+		writeHTTPError(server, http.StatusBadGateway, "some error")
+		server.Close()
+	}()
+
+	raw, err := io.ReadAll(client)
+	if err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	out := string(raw)
+	if !strings.Contains(out, "502 Bad Gateway") {
+		t.Errorf("expected 502 status, got: %s", out)
+	}
+	if !strings.Contains(out, "some error") {
+		t.Errorf("expected body 'some error', got: %s", out)
 	}
 }

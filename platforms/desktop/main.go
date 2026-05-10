@@ -3,23 +3,34 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"embed"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 	"zyrln/relay/core"
 )
 
 const defaultProxyAddress = "direct"
+const appVersion = "1.5.1-pre4"
+
+//go:embed gui/*
+var embeddedGUI embed.FS
 
 type probe struct {
 	ID          string            `json:"id"`
@@ -66,6 +77,12 @@ type summary struct {
 	Categories map[string]int `json:"reachable_by_category"`
 }
 
+type desktopProfile struct {
+	ID     string            `json:"id"`
+	Name   string            `json:"name"`
+	Config map[string]string `json:"config"`
+}
+
 type proxyConfig struct {
 	label     string
 	guard     string
@@ -110,6 +127,11 @@ func (p proxyConfig) dialContext(timeout time.Duration) func(context.Context, st
 	return proxyOnlyDialer(p.proxyHost, timeout)
 }
 
+var (
+	caCertFlag = flag.String("ca-cert", "certs/zyrln-ca.pem", "local CA certificate path for HTTPS proxy interception")
+	caKeyFlag  = flag.String("ca-key", "certs/zyrln-ca-key.pem", "local CA private key path for HTTPS proxy interception")
+)
+
 func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Zyrln — domain-fronting reachability tool
@@ -117,7 +139,7 @@ func main() {
 Modes:
   (default)          run reachability probes and print a table
   -init-ca           generate a local CA cert for HTTPS proxy interception
-  -serve-proxy       start a local HTTP+HTTPS proxy backed by the relay
+	-serve-proxy       start local HTTP+HTTPS and SOCKS5 proxies backed by the relay
   -relay-fetch-url   fetch one URL through the full relay chain
   -export-config     print config as JSON for importing into the Android app
 
@@ -130,7 +152,7 @@ Flags:
 
 	configFlag := flag.String("config", "config.env", "path to config file (key=value, flag names as keys)")
 	proxyFlag := flag.String("proxy", defaultProxyAddress, "HTTP proxy URL for lab testing, or 'direct'/'none' for real in-country use")
-	timeoutFlag := flag.Duration("timeout", 12*time.Second, "per-probe timeout")
+	timeoutFlag := flag.Duration("timeout", 30*time.Second, "per-probe timeout")
 	repeatFlag := flag.Int("repeat", 1, "number of times to run each probe")
 	formatFlag := flag.String("format", "table", "output format: table or json")
 	outFlag := flag.String("out", "", "optional path to write the full JSON report")
@@ -142,15 +164,20 @@ Flags:
 	targetURLFlag := flag.String("target-url", "https://www.gstatic.com/generate_204", "target URL for relay probe and relay-fetch")
 	relayFetchURLFlag := flag.String("relay-fetch-url", "", "fetch this target URL through the full relay chain and print the decoded response")
 	bodyOutFlag := flag.String("body-out", "", "optional path to write the decoded relay response body")
-	serveProxyFlag := flag.Bool("serve-proxy", false, "start a local HTTP proxy backed by the relay")
+	serveProxyFlag := flag.Bool("serve-proxy", false, "start local HTTP and SOCKS5 proxies backed by the relay")
 	listenFlag := flag.String("listen", "127.0.0.1:8085", "listen address for -serve-proxy")
+	socksListenFlag := flag.String("socks-listen", "127.0.0.1:1080", "SOCKS5 listen address for -serve-proxy")
 	exportConfigFlag := flag.Bool("export-config", false, "print config as JSON for importing into the Android app")
 	initCAFlag := flag.Bool("init-ca", false, "generate a local CA certificate for HTTPS proxy interception")
-	caCertFlag := flag.String("ca-cert", "certs/zyrln-ca.pem", "local CA certificate path for HTTPS proxy interception")
-	caKeyFlag := flag.String("ca-key", "certs/zyrln-ca-key.pem", "local CA private key path for HTTPS proxy interception")
 	frontRedirectsFlag := flag.Bool("front-redirects", false, "when a fronted probe gets a redirect, retry the Location using the front domain and encrypted Host override")
 	followRedirectsFlag := flag.Bool("follow-redirects", true, "follow HTTP redirects")
+	guiFlag := flag.Bool("gui", false, "start the browser-based GUI")
+	guiListenFlag := flag.String("gui-listen", "127.0.0.1:8086", "listen address for the GUI")
 	flag.Parse()
+
+	if shouldStartGUIByDefault(runtime.GOOS, os.Args) {
+		*guiFlag = true
+	}
 
 	// Apply config file values for flags not set on the CLI.
 	setCLI := map[string]bool{}
@@ -164,6 +191,11 @@ Flags:
 	if *repeatFlag < 1 {
 		fmt.Fprintln(os.Stderr, "repeat must be at least 1")
 		os.Exit(1)
+	}
+
+	if *guiFlag {
+		startGUIServer(*guiListenFlag, *configFlag, *caCertFlag, *caKeyFlag)
+		return
 	}
 
 	if *exportConfigFlag {
@@ -242,11 +274,12 @@ Flags:
 			os.Exit(1)
 		}
 		fmt.Printf("relay HTTP proxy listening on http://%s\n", *listenFlag)
+		fmt.Printf("relay SOCKS5 proxy listening on socks5://%s\n", *socksListenFlag)
 		fmt.Printf("mode: HTTP and HTTPS via local CA MITM; install %s as trusted CA for browsers\n", *caCertFlag)
 		if len(appScriptURLs) > 1 {
 			fmt.Printf("fallback: %d Apps Script URLs configured\n", len(appScriptURLs))
 		}
-		if err := core.ServeProxy(*listenFlag, appScriptURLs, *frontDomainFlag, *authKeyFlag, ca, client, *timeoutFlag); err != nil {
+		if err := core.ServeProxyWithSOCKS(*listenFlag, *socksListenFlag, appScriptURLs, *frontDomainFlag, *authKeyFlag, ca, client, *timeoutFlag); err != nil {
 			fmt.Fprintf(os.Stderr, "proxy failed: %v\n", err)
 			os.Exit(1)
 		}
@@ -396,7 +429,7 @@ func frontedAppScriptProbes(rawURL, frontDomain, authKey, targetURL string) ([]p
 	if strings.TrimSpace(authKey) != "" {
 		payload := map[string]any{
 			"k": authKey, "m": "GET", "u": targetURL,
-			"h": map[string]string{"User-Agent": "zyrln/0.1"},
+			"h":  map[string]string{"User-Agent": "zyrln/0.1"},
 			"ct": nil, "r": true,
 		}
 		encoded, _ := json.Marshal(payload)
@@ -684,4 +717,613 @@ func loadConfig(path string) map[string]string {
 		}
 	}
 	return values
+}
+
+func saveConfig(path string, values map[string]string) error {
+	keys := make([]string, 0, len(values))
+	for k := range values {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	lines := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if strings.TrimSpace(k) == "" {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("%s = %s", k, strings.TrimSpace(values[k])))
+	}
+	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0644)
+}
+
+func profilesPath(configPath string) string {
+	return configPath + ".profiles.json"
+}
+
+func loadProfiles(configPath string) []desktopProfile {
+	data, err := os.ReadFile(profilesPath(configPath))
+	if err != nil {
+		return []desktopProfile{}
+	}
+	var profiles []desktopProfile
+	if err := json.Unmarshal(data, &profiles); err != nil {
+		return []desktopProfile{}
+	}
+	return profiles
+}
+
+func saveProfiles(configPath string, profiles []desktopProfile) error {
+	if profiles == nil {
+		profiles = []desktopProfile{}
+	}
+	data, err := json.MarshalIndent(profiles, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(profilesPath(configPath), append(data, '\n'), 0644)
+}
+
+var globalDesktopConfigKeys = map[string]bool{
+	"listen":       true,
+	"socks-listen": true,
+}
+
+func profileConfig(values map[string]string) map[string]string {
+	cfg := map[string]string{}
+	for k, v := range values {
+		key := strings.TrimSpace(k)
+		if key == "" || globalDesktopConfigKeys[key] {
+			continue
+		}
+		cfg[key] = strings.TrimSpace(v)
+	}
+	return cfg
+}
+
+func applyProfileConfig(base, profile map[string]string) map[string]string {
+	merged := map[string]string{}
+	for k, v := range base {
+		merged[k] = v
+	}
+	for k, v := range profileConfig(profile) {
+		merged[k] = v
+	}
+	return merged
+}
+
+func profileDisplayName(name string, cfg map[string]string) string {
+	name = strings.TrimSpace(name)
+	if name != "" {
+		return name
+	}
+	rawURL := strings.TrimSpace(cfg["fronted-appscript-url"])
+	if rawURL == "" {
+		return "Profile"
+	}
+	first := strings.TrimSpace(strings.Split(rawURL, ",")[0])
+	u, err := url.Parse(first)
+	if err == nil && u.Hostname() != "" {
+		return u.Hostname()
+	}
+	return "Profile"
+}
+
+func shouldStartGUIByDefault(goos string, args []string) bool {
+	return goos == "windows" && len(args) <= 1
+}
+
+const maxGUILogEntries = 500
+
+type guiLogEntry struct {
+	Level string
+	Msg   string
+}
+
+var (
+	guiProxyServer    *http.Server
+	guiProxyLn        net.Listener
+	guiSOCKSServer    *core.SOCKSServer
+	guiSOCKSLn        net.Listener
+	guiCoalescer      *core.Coalescer
+	guiRequestCount   int64
+	guiProxyStartTime time.Time
+	guiMu             sync.Mutex
+
+	guiLogMu  sync.Mutex
+	guiLogBuf []guiLogEntry
+	guiLogSeq int
+)
+
+func guiEmitLog(level, msg string) {
+	guiLogMu.Lock()
+	guiLogBuf = append(guiLogBuf, guiLogEntry{Level: level, Msg: msg})
+	if len(guiLogBuf) > maxGUILogEntries {
+		guiLogBuf = guiLogBuf[1:]
+	}
+	guiLogSeq++
+	guiLogMu.Unlock()
+}
+
+type guiProxyStarter func(listen, socksListen string, urls []string, key string, ca *core.CertAuthority) (*http.Server, net.Listener, *core.SOCKSServer, net.Listener, error)
+
+func defaultGUIProxyStarter(listen, socksListen string, urls []string, key string, ca *core.CertAuthority) (*http.Server, net.Listener, *core.SOCKSServer, net.Listener, error) {
+	client := core.NewHTTPClient(30 * time.Second)
+	srv, ln, socksSrv, socksLn, coal, err := core.StartProxyWithSOCKSAndCoalescer(listen, socksListen, urls, "www.google.com", key, ca, client, 30*time.Second)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	// Note: guiMu is held by the caller — store coalescer directly without re-locking.
+	guiCoalescer = coal
+	return srv, ln, socksSrv, socksLn, nil
+}
+
+func startGUIServer(listenAddr, configPath, caCertPath, caKeyPath string) {
+	fmt.Printf("Starting Zyrln GUI at http://%s\n", listenAddr)
+
+	// Automatically open the browser
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		openBrowser("http://" + listenAddr)
+	}()
+
+	core.OnRequest = func(method, url string) {
+		atomic.AddInt64(&guiRequestCount, 1)
+	}
+	core.SetLogFunc(func(level, msg string) {
+		guiEmitLog(level, msg)
+	})
+
+	handler := newGUIHandler(configPath, caCertPath, caKeyPath, defaultGUIProxyStarter, openPath)
+	if err := http.ListenAndServe(listenAddr, handler); err != nil {
+		fmt.Fprintf(os.Stderr, "GUI server failed: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func newGUIHandler(configPath, caCertPath, caKeyPath string, startProxy guiProxyStarter, open func(string)) http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+		guiMu.Lock()
+		running := guiProxyServer != nil
+		started := guiProxyStartTime
+		guiMu.Unlock()
+
+		uptime := "00:00:00"
+		if !started.IsZero() {
+			d := time.Since(started).Round(time.Second)
+			h := d / time.Hour
+			d -= h * time.Hour
+			m := d / time.Minute
+			d -= m * time.Minute
+			s := d / time.Second
+			uptime = fmt.Sprintf("%02d:%02d:%02d", h, m, s)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"running":  running,
+			"uptime":   uptime,
+			"requests": atomic.LoadInt64(&guiRequestCount),
+			"version":  appVersion,
+			"os":       runtime.GOOS,
+			"arch":     runtime.GOARCH,
+		})
+	})
+
+	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			var cfg map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if err := saveConfig(configPath, cfg); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		json.NewEncoder(w).Encode(loadConfig(configPath))
+	})
+
+	mux.HandleFunc("/api/profiles", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			json.NewEncoder(w).Encode(loadProfiles(configPath))
+		case http.MethodPost:
+			var req struct {
+				ID     string            `json:"id"`
+				Name   string            `json:"name"`
+				Config map[string]string `json:"config"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if req.Config == nil {
+				req.Config = map[string]string{}
+			}
+			req.Config = profileConfig(req.Config)
+			profiles := loadProfiles(configPath)
+			id := strings.TrimSpace(req.ID)
+			if id == "__direct__" {
+				http.Error(w, "reserved profile id", http.StatusBadRequest)
+				return
+			}
+			if id == "" {
+				id = fmt.Sprintf("profile-%d", time.Now().UnixNano())
+			}
+			profile := desktopProfile{
+				ID:     id,
+				Name:   profileDisplayName(req.Name, req.Config),
+				Config: req.Config,
+			}
+			replaced := false
+			for i := range profiles {
+				if profiles[i].ID == id {
+					profiles[i] = profile
+					replaced = true
+					break
+				}
+			}
+			if !replaced {
+				profiles = append(profiles, profile)
+			}
+			if err := saveProfiles(configPath, profiles); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(profile)
+		case http.MethodDelete:
+			id := strings.TrimSpace(r.URL.Query().Get("id"))
+			if id == "" {
+				http.Error(w, "id is required", http.StatusBadRequest)
+				return
+			}
+			if id == "__direct__" {
+				http.Error(w, "cannot delete built-in profile", http.StatusBadRequest)
+				return
+			}
+			profiles := loadProfiles(configPath)
+			filtered := profiles[:0]
+			for _, p := range profiles {
+				if p.ID != id {
+					filtered = append(filtered, p)
+				}
+			}
+			if err := saveProfiles(configPath, filtered); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	mux.HandleFunc("/api/profiles/activate", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		guiMu.Lock()
+		running := guiProxyServer != nil
+		guiMu.Unlock()
+		if running {
+			http.Error(w, "stop proxy before switching profiles", http.StatusConflict)
+			return
+		}
+		var req struct {
+			ID string `json:"id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		for _, p := range loadProfiles(configPath) {
+			if p.ID == strings.TrimSpace(req.ID) {
+				cfg := applyProfileConfig(loadConfig(configPath), p.Config)
+				if err := saveConfig(configPath, cfg); err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+		}
+		http.Error(w, "profile not found", http.StatusNotFound)
+	})
+
+	mux.HandleFunc("/api/init-ca", func(w http.ResponseWriter, r *http.Request) {
+		// Stop proxy if running — old CA in memory would cause signature mismatch
+		guiMu.Lock()
+		if guiProxyServer != nil {
+			_ = guiProxyLn.Close()
+			_ = guiProxyServer.Close()
+			if guiSOCKSLn != nil {
+				_ = guiSOCKSLn.Close()
+			}
+			guiProxyServer = nil
+			guiProxyLn = nil
+			guiSOCKSServer = nil
+			guiSOCKSLn = nil
+			guiProxyStartTime = time.Time{}
+		}
+		guiMu.Unlock()
+
+		if err := core.GenerateCA(caCertPath, caKeyPath); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		ca, _ := core.LoadCA(caCertPath, caKeyPath)
+		serial := "unknown"
+		if ca != nil && ca.GetCertificate() != nil {
+			serial = ca.GetCertificate().SerialNumber.String()
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "ok",
+			"serial":  serial,
+			"message": "CA regenerated successfully.",
+		})
+	})
+
+	mux.HandleFunc("/api/start", func(w http.ResponseWriter, r *http.Request) {
+		guiMu.Lock()
+		if guiProxyServer != nil {
+			guiMu.Unlock()
+			http.Error(w, "already running", http.StatusConflict)
+			return
+		}
+		defer guiMu.Unlock()
+
+		cfg := loadConfig(configPath)
+		urls := parseURLList(cfg["fronted-appscript-url"])
+		key := cfg["auth-key"]
+		listen := cfg["listen"]
+		if listen == "" {
+			listen = "127.0.0.1:8085"
+		}
+		socksListen := cfg["socks-listen"]
+		if socksListen == "" {
+			socksListen = "127.0.0.1:1080"
+		}
+		directOnly := len(urls) == 0 && core.GetDirectEnabled()
+		if len(urls) == 0 && !directOnly {
+			http.Error(w, "fronted-appscript-url is required", http.StatusBadRequest)
+			return
+		}
+		if !directOnly && strings.TrimSpace(key) == "" {
+			http.Error(w, "auth-key is required", http.StatusBadRequest)
+			return
+		}
+
+		var ca *core.CertAuthority
+		if !directOnly {
+			var err error
+			ca, err = core.LoadCA(caCertPath, caKeyPath)
+			if err != nil {
+				http.Error(w, "CA certificate missing or invalid. Install certificate first.", http.StatusBadRequest)
+				return
+			}
+		}
+
+		srv, ln, socksSrv, socksLn, err := startProxy(listen, socksListen, urls, key, ca)
+		if err != nil {
+			http.Error(w, "start failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		guiLogMu.Lock()
+		guiLogBuf = guiLogBuf[:0]
+		guiLogSeq = 0
+		guiLogMu.Unlock()
+
+		guiProxyServer = srv
+		guiProxyLn = ln
+		guiSOCKSServer = socksSrv
+		guiSOCKSLn = socksLn
+		guiProxyStartTime = time.Now()
+		w.WriteHeader(http.StatusOK)
+	})
+
+	mux.HandleFunc("/api/stop", func(w http.ResponseWriter, r *http.Request) {
+		guiMu.Lock()
+		if guiProxyServer == nil {
+			guiMu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		_ = guiProxyLn.Close()
+		_ = guiProxyServer.Close()
+		if guiSOCKSLn != nil {
+			_ = guiSOCKSLn.Close()
+		}
+		guiProxyServer = nil
+		guiProxyLn = nil
+		guiSOCKSServer = nil
+		guiSOCKSLn = nil
+		guiCoalescer = nil
+		guiProxyStartTime = time.Time{}
+		guiMu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	})
+
+	mux.HandleFunc("/api/logs", func(w http.ResponseWriter, r *http.Request) {
+		clientSeq := 0
+		if s := r.URL.Query().Get("seq"); s != "" {
+			fmt.Sscanf(s, "%d", &clientSeq)
+			if clientSeq < 0 {
+				clientSeq = 0
+			}
+		}
+		guiLogMu.Lock()
+		total := len(guiLogBuf)
+		seq := guiLogSeq
+		missed := seq - clientSeq
+		var entries []guiLogEntry
+		if missed > 0 {
+			if missed > total {
+				missed = total
+			}
+			entries = make([]guiLogEntry, missed)
+			copy(entries, guiLogBuf[total-missed:])
+		}
+		guiLogMu.Unlock()
+
+		var sb strings.Builder
+		for _, e := range entries {
+			sb.WriteString(e.Level)
+			sb.WriteByte('\t')
+			sb.WriteString(e.Msg)
+			sb.WriteByte('\n')
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("X-Log-Seq", fmt.Sprintf("%d", seq))
+		w.Write([]byte(sb.String()))
+	})
+
+	mux.HandleFunc("/api/ping", func(w http.ResponseWriter, r *http.Request) {
+		guiMu.Lock()
+		coal := guiCoalescer
+		guiMu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		start := time.Now()
+		var err error
+		if coal != nil {
+			_, err = coal.Submit("HEAD", "https://www.gstatic.com/generate_204", map[string]string{}, nil)
+		} else {
+			cfg := loadConfig(configPath)
+			urls := parseURLList(cfg["fronted-appscript-url"])
+			key := cfg["auth-key"]
+			if len(urls) == 0 || strings.TrimSpace(key) == "" {
+				// No relay config — ping via direct fragmented connection to gstatic
+				conn, ok := core.DialFragment("www.gstatic.com:443")
+				if ok {
+					conn.Close()
+				} else {
+					err = fmt.Errorf("direct connection failed")
+				}
+			} else {
+				client := core.NewHTTPClient(15 * time.Second)
+				_, err = core.RelayRequestMulti(client, urls, "www.google.com", key,
+					"HEAD", "https://www.gstatic.com/generate_204",
+					map[string]string{}, nil, 15*time.Second)
+			}
+		}
+		ms := time.Since(start).Milliseconds()
+		if err != nil {
+			json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true, "ms": ms})
+	})
+
+	mux.HandleFunc("/api/probes", func(w http.ResponseWriter, r *http.Request) {
+		cfg := loadConfig(configPath)
+		urls := parseURLList(cfg["fronted-appscript-url"])
+		key := cfg["auth-key"]
+		target := cfg["target-url"]
+		if target == "" {
+			target = "https://www.gstatic.com/generate_204"
+		}
+
+		client := &http.Client{Timeout: 30 * time.Second}
+		probes := filterProbes(defaultProbes(), "")
+		if len(urls) > 0 {
+			fp, _ := frontedAppScriptProbes(urls[0], "www.google.com", key, target)
+			probes = append(probes, fp...)
+		}
+
+		results := make([]result, 0, len(probes))
+		for _, p := range probes {
+			results = append(results, runProbe(client, p, 1, 30*time.Second, false))
+		}
+		json.NewEncoder(w).Encode(results)
+	})
+
+	mux.HandleFunc("/api/export", func(w http.ResponseWriter, r *http.Request) {
+		cfg := loadConfig(configPath)
+		urls := cfg["fronted-appscript-url"]
+		key := cfg["auth-key"]
+		json.NewEncoder(w).Encode(map[string]string{
+			"url": urls,
+			"key": key,
+		})
+	})
+
+	mux.HandleFunc("/api/download-ca", func(w http.ResponseWriter, r *http.Request) {
+		data, err := os.ReadFile(caCertPath)
+		if err != nil {
+			http.Error(w, "CA certificate not found. Click Init first.", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-x509-ca-cert")
+		w.Header().Set("Content-Disposition", "attachment; filename=\"zyrln-ca.pem\"")
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
+		w.Write(data)
+	})
+	mux.HandleFunc("/api/open-certs-dir", func(w http.ResponseWriter, r *http.Request) {
+		dir := filepath.Dir(caCertPath)
+		if _, err := os.Stat(dir); os.IsNotExist(err) {
+			os.MkdirAll(dir, 0755)
+		}
+		open(dir)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	mux.HandleFunc("/api/settings", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			var req struct {
+				DirectEnabled *bool `json:"directEnabled"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if req.DirectEnabled != nil {
+				core.SetDirectEnabled(*req.DirectEnabled)
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"directEnabled": core.GetDirectEnabled(),
+		})
+	})
+
+	// Serve frontend from /platforms/desktop/gui
+	guiFS, err := fs.Sub(embeddedGUI, "gui")
+	if err != nil {
+		mux.Handle("/", http.FileServer(http.Dir(filepath.Join("platforms", "desktop", "gui"))))
+	} else {
+		mux.Handle("/", http.FileServer(http.FS(guiFS)))
+	}
+	return mux
+}
+
+func openBrowser(url string) {
+	openPath(url)
+}
+
+func openPath(p string) {
+	var err error
+	switch runtime.GOOS {
+	case "linux":
+		err = exec.Command("xdg-open", p).Start()
+	case "windows":
+		err = exec.Command("rundll32", "url.dll,FileProtocolHandler", p).Start()
+	case "darwin":
+		err = exec.Command("open", p).Start()
+	default:
+		err = fmt.Errorf("unsupported platform")
+	}
+	if err != nil {
+		fmt.Printf("Failed to open %s: %v\n", p, err)
+	}
 }

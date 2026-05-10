@@ -3,7 +3,7 @@ ANDROID_HOME ?= $(HOME)/Android/Sdk
 GOTOOLCHAIN  ?= go1.25.0
 GOFLAGS      ?= -buildvcs=false
 AAR_OUT       = android/app/libs/mobile.aar
-APK_VERSION   = 1.4.0
+APK_VERSION   = 1.5.1
 APK_RELEASE   = android/app/build/outputs/apk/release/zyrln-$(APK_VERSION).apk
 APK_DEBUG     = android/app/build/outputs/apk/debug/zyrln-$(APK_VERSION)-debug.apk
 
@@ -11,7 +11,7 @@ export ANDROID_HOME
 export GOTOOLCHAIN
 export GOFLAGS
 
-.PHONY: all desktop proxy test android android-debug keystore clean
+.PHONY: all desktop gui proxy test android android-debug keystore clean
 
 all: desktop
 
@@ -27,6 +27,10 @@ proxy:
 		exit 1; \
 	fi
 	GOCACHE=$(GOCACHE) go run ./platforms/desktop/ -serve-proxy
+
+## Start the browser-based GUI.
+gui: desktop
+	./zyrln -gui
 
 ## Smoke test the full relay chain.
 test:

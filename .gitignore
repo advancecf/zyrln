@@ -39,3 +39,11 @@ CLAUDE.md
 TODO.md
 .codex
 .agents
+*.apk
+*.exe
+zyrln-linux-amd64
+docs/node_modules/
+docs/.vitepress/cache/
+config.env.profiles.json
+zyrln-*
+coverage.out

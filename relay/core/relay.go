@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,16 +58,16 @@ func perURLTimeout(total time.Duration, n int) time.Duration {
 }
 
 type workerResponse struct {
-	Status  int               `json:"s"`
-	Headers map[string]string `json:"h"`
-	Body    string            `json:"b"`
-	Error   string            `json:"e"`
+	Status  int            `json:"s"`
+	Headers map[string]any `json:"h"`
+	Body    string         `json:"b"`
+	Error   string         `json:"e"`
 }
 
 // RelayResponse is the decoded response from the relay chain.
 type RelayResponse struct {
 	Status  int
-	Headers map[string]string
+	Headers map[string][]string
 	Body    []byte
 }
 
@@ -76,11 +77,11 @@ func NewHTTPClient(timeout time.Duration) *http.Client {
 		Timeout: timeout,
 		Transport: &http.Transport{
 			TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
-			DialContext:         (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-			MaxIdleConns:        64,
-			MaxIdleConnsPerHost: 8,
+			DialContext:         (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			MaxIdleConns:        128,
+			MaxIdleConnsPerHost: 32,
 			IdleConnTimeout:     120 * time.Second,
-			TLSHandshakeTimeout: 15 * time.Second,
+			TLSHandshakeTimeout: 10 * time.Second,
 			ForceAttemptHTTP2:   true,
 		},
 	}
@@ -118,19 +119,37 @@ func RelayRequestMulti(
 	}
 	payload := buildRelayPayload(authKey, method, targetURL, headers, body)
 	start := int(activeURLIdx.Load()) % n
-	urlTimeout := perURLTimeout(timeout, n)
-	var lastErr error
+	// Each parallel goroutine gets the full timeout since they race simultaneously
+
+	// Race all URLs in parallel — first success wins
+	type raceResult struct {
+		resp RelayResponse
+		idx  int
+		err  error
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ch := make(chan raceResult, n)
 	for i := 0; i < n; i++ {
 		idx := (start + i) % n
-		resp, err := tryOneURL(client, appScriptURLs[idx], frontDomain, payload, urlTimeout)
-		if err == nil {
-			if i > 0 {
-				activeURLIdx.Store(int64(idx))
-				fmt.Printf("[relay] quota exhausted on URL %d, switched to URL %d/%d\n", start+1, idx+1, n)
+		go func(idx int) {
+			resp, err := tryOneURL(ctx, client, appScriptURLs[idx], frontDomain, payload, timeout)
+			ch <- raceResult{resp, idx, err}
+		}(idx)
+	}
+
+	var lastErr error
+	for i := 0; i < n; i++ {
+		r := <-ch
+		if r.err == nil {
+			cancel() // cancel losing goroutines
+			if r.idx != start {
+				activeURLIdx.Store(int64(r.idx))
 			}
-			return resp, nil
+			return r.resp, nil
 		}
-		lastErr = err
+		lastErr = r.err
 	}
 	return RelayResponse{}, lastErr
 }
@@ -148,7 +167,11 @@ type Coalescer struct {
 	maxBatch      int
 	ch            chan *coalescerItem
 	cache         *responseCache
+	stopCh        chan struct{}
+	stopOnce      sync.Once
 }
+
+const keepaliveInterval = 4 * time.Minute
 
 type coalescerItem struct {
 	method    string
@@ -164,11 +187,11 @@ type coalescerResult struct {
 }
 
 type batchPayloadItem struct {
-	Method    string            `json:"m"`
-	URL       string            `json:"u"`
-	Headers   map[string]string `json:"h"`
-	Body      string            `json:"b,omitempty"`
-	Redirect  bool              `json:"r"`
+	Method   string            `json:"m"`
+	URL      string            `json:"u"`
+	Headers  map[string]string `json:"h"`
+	Body     string            `json:"b,omitempty"`
+	Redirect bool              `json:"r"`
 }
 
 type batchEnvelope struct {
@@ -188,13 +211,20 @@ func NewCoalescer(client *http.Client, appScriptURLs []string, frontDomain, auth
 		frontDomain:   frontDomain,
 		authKey:       authKey,
 		timeout:       timeout,
-		window:        15 * time.Millisecond,
-		maxBatch:      10,
+		window:        3 * time.Millisecond,
+		maxBatch:      20,
 		ch:            make(chan *coalescerItem, 512),
 		cache:         newResponseCache(),
+		stopCh:        make(chan struct{}),
 	}
 	go c.run()
+	go c.keepaliveLoop()
 	return c
+}
+
+// Stop shuts down the keepalive loop. Safe to call multiple times.
+func (c *Coalescer) Stop() {
+	c.stopOnce.Do(func() { close(c.stopCh) })
 }
 
 // Warmup fires a background relay request to pre-warm the Apps Script instance
@@ -205,10 +235,36 @@ func (c *Coalescer) Warmup() {
 	}()
 }
 
+// keepaliveLoop sends a lightweight ping through every configured script URL
+// every keepaliveInterval to prevent Apps Script cold starts.
+func (c *Coalescer) keepaliveLoop() {
+	ticker := time.NewTicker(keepaliveInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			for _, u := range c.appScriptURLs {
+				u := u
+				go func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+					defer cancel()
+					payload := buildRelayPayload(c.authKey, "HEAD", "https://www.gstatic.com/generate_204", map[string]string{}, nil)
+					_, _ = tryOneURL(ctx, c.client, u, c.frontDomain, payload, 15*time.Second)
+				}()
+			}
+		case <-c.stopCh:
+			return
+		}
+	}
+}
+
 // Submit queues a relay request and blocks until the response is ready.
 // GET responses that carry a positive Cache-Control max-age are served from an
 // in-memory cache on subsequent calls, bypassing the relay entirely.
 func (c *Coalescer) Submit(method, targetURL string, headers map[string]string, body []byte) (RelayResponse, error) {
+	if OnRequest != nil {
+		OnRequest(method, targetURL)
+	}
 	if method == "GET" && len(body) == 0 {
 		if e := c.cache.get(targetURL); e != nil {
 			return RelayResponse{Status: e.status, Headers: e.headers, Body: e.body}, nil
@@ -228,10 +284,10 @@ func (c *Coalescer) Submit(method, targetURL string, headers map[string]string, 
 		return r.resp, r.err
 	}
 
-	if ttl := cacheableMaxAge(method, headers, r.resp.Headers, r.resp.Status); ttl > 0 {
+	if ttl := cacheableMaxAge(method, headers, r.resp.Headers, r.resp.Status, targetURL); ttl > 0 {
 		bodyCopy := make([]byte, len(r.resp.Body))
 		copy(bodyCopy, r.resp.Body)
-		headersCopy := make(map[string]string, len(r.resp.Headers))
+		headersCopy := make(map[string][]string, len(r.resp.Headers))
 		for k, v := range r.resp.Headers {
 			headersCopy[k] = v
 		}
@@ -246,7 +302,7 @@ func (c *Coalescer) Submit(method, targetURL string, headers map[string]string, 
 	return r.resp, r.err
 }
 
-const burstWindow = 40 * time.Millisecond
+const burstWindow = 10 * time.Millisecond
 
 func (c *Coalescer) run() {
 	for {
@@ -272,10 +328,10 @@ func (c *Coalescer) run() {
 		}
 		timer.Stop()
 
+		prioritizeBatch(batch)
+
 		if len(batch) == 1 {
-			resp, err := RelayRequestMulti(c.client, c.appScriptURLs, c.frontDomain, c.authKey,
-				batch[0].method, batch[0].targetURL, batch[0].headers, batch[0].body, c.timeout)
-			batch[0].result <- coalescerResult{resp, err}
+			go c.flushSingle(batch[0])
 			continue
 		}
 
@@ -284,14 +340,111 @@ func (c *Coalescer) run() {
 	}
 }
 
+func (c *Coalescer) flushSingle(item *coalescerItem) {
+	resp, err := RelayRequestMulti(c.client, c.appScriptURLs, c.frontDomain, c.authKey,
+		item.method, item.targetURL, item.headers, item.body, c.timeout)
+	item.result <- coalescerResult{resp, err}
+}
+
+func prioritizeBatch(batch []*coalescerItem) {
+	sort.SliceStable(batch, func(i, j int) bool {
+		return requestPriority(batch[i]) < requestPriority(batch[j])
+	})
+}
+
+func requestPriority(item *coalescerItem) int {
+	method := strings.ToUpper(item.method)
+	target := strings.ToLower(item.targetURL)
+	accept := strings.ToLower(headerValue(item.headers, "Accept"))
+	dest := strings.ToLower(headerValue(item.headers, "Sec-Fetch-Dest"))
+
+	if method == "GET" {
+		switch {
+		case strings.Contains(accept, "text/html") || dest == "document":
+			return 0
+		case strings.Contains(accept, "text/css") || hasURLPathSuffix(target, ".css") || dest == "style":
+			return 5
+		case strings.Contains(accept, "javascript") || hasURLPathSuffix(target, ".js") || dest == "script":
+			return 10
+		case dest == "font" || hasURLPathSuffix(target, ".woff") || hasURLPathSuffix(target, ".woff2") || hasURLPathSuffix(target, ".ttf"):
+			return 20
+		case dest == "image" || isImageURL(target):
+			return 30
+		case isTelemetryURL(target):
+			return 80
+		default:
+			return 40
+		}
+	}
+
+	if isTelemetryURL(target) {
+		return 80
+	}
+	return 40
+}
+
+func headerValue(headers map[string]string, key string) string {
+	for k, v := range headers {
+		if strings.EqualFold(k, key) {
+			return v
+		}
+	}
+	return ""
+}
+
+func hasURLPathSuffix(raw, suffix string) bool {
+	path := raw
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
+	return strings.HasSuffix(path, suffix)
+}
+
+func isImageURL(raw string) bool {
+	for _, ext := range []string{".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".avif"} {
+		if hasURLPathSuffix(raw, ext) {
+			return true
+		}
+	}
+	return false
+}
+
+func isTelemetryURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	path := strings.ToLower(u.EscapedPath())
+
+	if strings.Contains(path, "gen_204") ||
+		strings.Contains(path, "generate_204") ||
+		strings.Contains(path, "domainreliability/upload") ||
+		strings.Contains(path, "/collect") ||
+		strings.Contains(path, "/g/collect") ||
+		strings.Contains(path, "/log") {
+		return true
+	}
+
+	return strings.Contains(host, "analytics") ||
+		strings.Contains(host, "doubleclick.net") ||
+		strings.Contains(host, "googletagmanager.com") ||
+		strings.Contains(host, "googleadservices.com")
+}
+
 func (c *Coalescer) flush(batch []*coalescerItem) {
+	if len(c.appScriptURLs) == 0 {
+		c.failAll(batch, fmt.Errorf("no Apps Script URLs configured"))
+		return
+	}
+
 	items := make([]batchPayloadItem, len(batch))
 	for i, item := range batch {
 		pi := batchPayloadItem{
 			Method:   strings.ToUpper(item.method),
 			URL:      item.targetURL,
 			Headers:  item.headers,
-			Redirect: true,
+			Redirect: false,
 		}
 		if len(item.body) > 0 {
 			pi.Body = base64.StdEncoding.EncodeToString(item.body)
@@ -308,21 +461,51 @@ func (c *Coalescer) flush(batch []*coalescerItem) {
 
 	n := len(c.appScriptURLs)
 	start := int(activeURLIdx.Load()) % n
-	urlTimeout := perURLTimeout(c.timeout, n)
+	// Each parallel goroutine gets the full timeout since they race simultaneously
+
+	// Try all URLs in parallel — use the first successful response
+	type raceResult struct {
+		raw []byte
+		idx int
+		err error
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	results := make(chan raceResult, n)
+	for i := 0; i < n; i++ {
+		idx := (start + i) % n
+		go func(idx int) {
+			raw, err := appsScriptRoundTrip(ctx, c.client, c.appScriptURLs[idx], c.frontDomain, string(payload), c.timeout)
+			results <- raceResult{raw, idx, err}
+		}(idx)
+	}
+
 	var raw []byte
 	var lastErr error
 	for i := 0; i < n; i++ {
-		idx := (start + i) % n
-		raw, lastErr = appsScriptRoundTrip(c.client, c.appScriptURLs[idx], c.frontDomain, string(payload), urlTimeout)
-		if lastErr == nil {
-			if i > 0 {
-				activeURLIdx.Store(int64(idx))
+		r := <-results
+		if r.err == nil {
+			if raw == nil {
+				raw = r.raw
+				cancel() // cancel losing goroutines
+				if r.idx != start {
+					activeURLIdx.Store(int64(r.idx))
+				}
 			}
-			break
+		} else {
+			// Only capture the error if we haven't succeeded yet and it's not a cancellation
+			if raw == nil && !errors.Is(r.err, context.Canceled) {
+				lastErr = r.err
+			}
 		}
 	}
-	if lastErr != nil {
+	if raw == nil && lastErr != nil {
 		c.failAll(batch, lastErr)
+		return
+	}
+	if raw == nil {
+		c.failAll(batch, fmt.Errorf("relay failed: all workers returned without data"))
 		return
 	}
 
@@ -353,7 +536,7 @@ func (c *Coalescer) flush(batch []*coalescerItem) {
 			batch[i].result <- coalescerResult{err: fmt.Errorf("invalid base64: %w", err)}
 			continue
 		}
-		batch[i].result <- coalescerResult{resp: RelayResponse{Status: wr.Status, Headers: wr.Headers, Body: decoded}}
+		batch[i].result <- coalescerResult{resp: RelayResponse{Status: wr.Status, Headers: normalizeHeaders(wr.Headers), Body: decoded}}
 	}
 }
 
@@ -363,8 +546,8 @@ func (c *Coalescer) failAll(batch []*coalescerItem, err error) {
 	}
 }
 
-func tryOneURL(client *http.Client, appScriptURL, frontDomain, payload string, timeout time.Duration) (RelayResponse, error) {
-	raw, err := appsScriptRoundTrip(client, appScriptURL, frontDomain, payload, timeout)
+func tryOneURL(ctx context.Context, client *http.Client, appScriptURL, frontDomain, payload string, timeout time.Duration) (RelayResponse, error) {
+	raw, err := appsScriptRoundTrip(ctx, client, appScriptURL, frontDomain, payload, timeout)
 	if err != nil {
 		return RelayResponse{}, err
 	}
@@ -372,7 +555,7 @@ func tryOneURL(client *http.Client, appScriptURL, frontDomain, payload string, t
 	var workerResp workerResponse
 	if err := json.Unmarshal(raw, &workerResp); err != nil {
 		if strings.HasPrefix(strings.TrimSpace(string(raw)), "<") {
-			return RelayResponse{}, fmt.Errorf("Apps Script returned an error page — quota may be exceeded or deployment is misconfigured")
+			return RelayResponse{}, fmt.Errorf("Apps Script returned HTML instead of JSON (quota/deploy issue): %s", previewBytes(raw, 512))
 		}
 		return RelayResponse{}, fmt.Errorf("invalid relay JSON: %w; body=%s", err, previewBytes(raw, 256))
 	}
@@ -385,14 +568,36 @@ func tryOneURL(client *http.Client, appScriptURL, frontDomain, payload string, t
 		return RelayResponse{}, fmt.Errorf("invalid base64 body: %w", err)
 	}
 
-	return RelayResponse{Status: workerResp.Status, Headers: workerResp.Headers, Body: decoded}, nil
+	return RelayResponse{Status: workerResp.Status, Headers: normalizeHeaders(workerResp.Headers), Body: decoded}, nil
+}
+
+func normalizeHeaders(raw map[string]any) map[string][]string {
+	out := make(map[string][]string, len(raw))
+	for k, v := range raw {
+		lk := strings.ToLower(k)
+		switch val := v.(type) {
+		case string:
+			out[lk] = []string{val}
+		case []any:
+			strs := make([]string, 0, len(val))
+			for _, item := range val {
+				if s, ok := item.(string); ok {
+					strs = append(strs, s)
+				}
+			}
+			out[lk] = strs
+		case []string:
+			out[lk] = val
+		}
+	}
+	return out
 }
 
 // appsScriptRoundTrip posts payload to the fronted Apps Script URL, following one redirect if needed.
-func appsScriptRoundTrip(client *http.Client, appScriptURL, frontDomain, payload string, timeout time.Duration) ([]byte, error) {
+func appsScriptRoundTrip(ctx context.Context, client *http.Client, appScriptURL, frontDomain, payload string, timeout time.Duration) ([]byte, error) {
 	noRedir := noRedirectClient(client)
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	req, err := newFrontedPOST(ctx, appScriptURL, frontDomain, payload)
@@ -450,7 +655,10 @@ func newFrontedGET(ctx context.Context, frontDomain, location, baseURL string) (
 		return nil, err
 	}
 	if loc.Scheme == "" || loc.Host == "" {
-		base, _ := url.Parse(baseURL)
+		base, err := url.Parse(baseURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid base url: %w", err)
+		}
 		loc = base.ResolveReference(loc)
 	}
 
@@ -483,7 +691,7 @@ func buildRelayPayload(authKey, method, targetURL string, headers map[string]str
 		"m": strings.ToUpper(method),
 		"u": targetURL,
 		"h": headers,
-		"r": true,
+		"r": false,
 	}
 	if len(body) > 0 {
 		payload["b"] = base64.StdEncoding.EncodeToString(body)
