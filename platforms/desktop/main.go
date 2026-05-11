@@ -27,7 +27,7 @@ import (
 )
 
 const defaultProxyAddress = "direct"
-const appVersion = "1.5.1-pre4"
+const appVersion = "1.5.1-pre5"
 
 //go:embed gui/*
 var embeddedGUI embed.FS
@@ -167,6 +167,8 @@ Flags:
 	serveProxyFlag := flag.Bool("serve-proxy", false, "start local HTTP and SOCKS5 proxies backed by the relay")
 	listenFlag := flag.String("listen", "127.0.0.1:8085", "listen address for -serve-proxy")
 	socksListenFlag := flag.String("socks-listen", "127.0.0.1:1080", "SOCKS5 listen address for -serve-proxy")
+	noDirectFlag := flag.Bool("no-direct", false, "disable direct TLS-fragmentation bypass for Google domains (route all traffic through relay)")
+	directEnabledFlag := flag.Bool("direct-enabled", true, "enable direct TLS-fragmentation bypass for Google domains (saved to config.env by GUI)")
 	exportConfigFlag := flag.Bool("export-config", false, "print config as JSON for importing into the Android app")
 	initCAFlag := flag.Bool("init-ca", false, "generate a local CA certificate for HTTPS proxy interception")
 	frontRedirectsFlag := flag.Bool("front-redirects", false, "when a fronted probe gets a redirect, retry the Location using the front domain and encrypted Host override")
@@ -191,6 +193,11 @@ Flags:
 	if *repeatFlag < 1 {
 		fmt.Fprintln(os.Stderr, "repeat must be at least 1")
 		os.Exit(1)
+	}
+
+	core.SetDirectEnabled(*directEnabledFlag)
+	if *noDirectFlag {
+		core.SetDirectEnabled(false)
 	}
 
 	if *guiFlag {
@@ -1044,6 +1051,10 @@ func newGUIHandler(configPath, caCertPath, caKeyPath string, startProxy guiProxy
 			if guiSOCKSLn != nil {
 				_ = guiSOCKSLn.Close()
 			}
+			if guiCoalescer != nil {
+				guiCoalescer.Stop()
+				guiCoalescer = nil
+			}
 			guiProxyServer = nil
 			guiProxyLn = nil
 			guiSOCKSServer = nil
@@ -1141,11 +1152,14 @@ func newGUIHandler(configPath, caCertPath, caKeyPath string, startProxy guiProxy
 		if guiSOCKSLn != nil {
 			_ = guiSOCKSLn.Close()
 		}
+		if guiCoalescer != nil {
+			guiCoalescer.Stop()
+			guiCoalescer = nil
+		}
 		guiProxyServer = nil
 		guiProxyLn = nil
 		guiSOCKSServer = nil
 		guiSOCKSLn = nil
-		guiCoalescer = nil
 		guiProxyStartTime = time.Time{}
 		guiMu.Unlock()
 		w.WriteHeader(http.StatusOK)
@@ -1186,6 +1200,11 @@ func newGUIHandler(configPath, caCertPath, caKeyPath string, startProxy guiProxy
 	})
 
 	mux.HandleFunc("/api/ping", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Direct bool `json:"direct"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+
 		guiMu.Lock()
 		coal := guiCoalescer
 		guiMu.Unlock()
@@ -1193,8 +1212,16 @@ func newGUIHandler(configPath, caCertPath, caKeyPath string, startProxy guiProxy
 		w.Header().Set("Content-Type", "application/json")
 		start := time.Now()
 		var err error
-		if coal != nil {
+		if !req.Direct && coal != nil {
 			_, err = coal.Submit("HEAD", "https://www.gstatic.com/generate_204", map[string]string{}, nil)
+		} else if req.Direct {
+			// Direct mode — always use fragmented connection, never relay
+			conn, ok := core.DialFragment("www.gstatic.com:443")
+			if ok {
+				conn.Close()
+			} else {
+				err = fmt.Errorf("direct connection failed")
+			}
 		} else {
 			cfg := loadConfig(configPath)
 			urls := parseURLList(cfg["fronted-appscript-url"])
@@ -1288,6 +1315,9 @@ func newGUIHandler(configPath, caCertPath, caKeyPath string, startProxy guiProxy
 			}
 			if req.DirectEnabled != nil {
 				core.SetDirectEnabled(*req.DirectEnabled)
+				cfg := loadConfig(configPath)
+				cfg["direct-enabled"] = fmt.Sprintf("%v", *req.DirectEnabled)
+				_ = saveConfig(configPath, cfg)
 			}
 			w.WriteHeader(http.StatusOK)
 			return
